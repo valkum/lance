@@ -79,17 +79,48 @@ impl RowAddrMask {
     }
 
     /// Return the indices of the input row ids that were valid
+    ///
+    /// [`Self::selected`] over a whole sequence, resolving each fragment once per run
+    /// instead of once per row.
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
-        row_ids
-            .enumerate()
-            .filter_map(|(idx, row_id)| {
-                if self.selected(*row_id) {
-                    Some(idx as u64)
-                } else {
-                    None
+        // Both variants hold the same map and differ only in what membership means.
+        let (fragments, select_if_in_map) = match self {
+            Self::AllowList(allow_list) => (allow_list, true),
+            Self::BlockList(block_list) => (block_list, false),
+        };
+
+        // The fragment whose selection is in hand. `selected` descends the `BTreeMap` for
+        // every row, and callers pass whole partitions, whose addresses arrive clustered
+        // by fragment. A cached `None` is a real answer: no entry for that fragment.
+        let mut current: Option<(u32, Option<&RowAddrSelection>)> = None;
+        let mut selected = Vec::with_capacity(row_ids.size_hint().0);
+
+        for (idx, row_id) in row_ids.enumerate() {
+            // High half is the fragment id, low half the row's offset within it.
+            let fragment_id = (row_id >> 32) as u32;
+            let offset = *row_id as u32;
+
+            let selection = match current {
+                Some((cached, selection)) if cached == fragment_id => selection,
+                _ => {
+                    let selection = fragments.get(&fragment_id);
+                    current = Some((fragment_id, selection));
+                    selection
                 }
-            })
-            .collect()
+            };
+
+            // Whether the map holds this row. `Full` holds every offset in the fragment.
+            let in_map = match selection {
+                None => false,
+                Some(RowAddrSelection::Full) => true,
+                Some(RowAddrSelection::Partial(fragment_set)) => fragment_set.contains(offset),
+            };
+
+            if in_map == select_if_in_map {
+                selected.push(idx as u64);
+            }
+        }
+        selected
     }
 
     /// Also block the given addrs
